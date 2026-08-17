@@ -1,0 +1,46 @@
+@startuml c4-dynamic-incoming-webhook
+' C4 Dynamic diagram - incoming connector webhook → state reconciliation → outgoing merchant webhook
+' Grounded in: crates/router/src/core/webhooks/{incoming.rs,outgoing.rs}, workflows/outgoing_webhook_retry.rs,
+'              api_models::webhooks::{IncomingWebhookEvent, OutgoingWebhookContent}, diesel_models events table
+!include lib/C4_Sequence.puml
+
+LAYOUT_WITH_LEGEND()
+autonumber "<b>[00]</b>"
+title Dynamic — Incoming connector webhook to outgoing merchant webhook
+
+System_Ext(psp, "Processor / connector", "")
+Container(router, "Router", "Rust")
+Component(wh_in, "Incoming webhooks", "core/webhooks/incoming.rs")
+Component(conn, "Connector webhook impl", "hyperswitch_connectors: IncomingWebhook trait")
+Component(core_domain, "Domain core", "payments / refunds / disputes / mandates / payouts")
+Component(wh_out, "Outgoing webhooks", "core/webhooks/outgoing.rs")
+ContainerDb(pg, "PostgreSQL", "events, payment_intent, payment_attempt, refund, dispute…")
+Component(sched, "Process tracker", "OutgoingWebhookRetryWorkflow")
+Container_Ext(merchant, "Merchant endpoint", "webhook_url on the profile")
+Container(kafka, "Kafka / event sinks", "")
+
+Rel(psp, wh_in, "POST /webhooks/{merchant_id}/{connector_id_or_name} (v1) or /v2/webhooks/{merchant_id}/{profile_id}/{connector_id}")
+Rel(wh_in, pg, "Resolve merchant account, profile, merchant_connector_account + webhook secret")
+Rel(wh_in, conn, "verify_webhook_source (HMAC/signature), get_webhook_object_reference_id, get_webhook_event_type")
+Rel(conn, wh_in, "IncomingWebhookEvent (payment/refund/dispute/mandate/payout/recovery/invoice)")
+Rel(wh_in, core_domain, "Reconcile: force PSync or apply the webhook body as the source of truth")
+Rel(core_domain, psp, "Optional confirmation call (webhook_source_verification_call / PSync)")
+Rel(core_domain, pg, "UPDATE intent/attempt/refund/dispute state idempotently")
+Rel(core_domain, wh_out, "Trigger merchant event if the state actually changed")
+Rel(wh_out, pg, "INSERT events row (event_id, event_type, delivery attempt, request/response)")
+Rel(wh_out, merchant, "POST signed OutgoingWebhookContent (payment/refund/dispute/mandate/payout/subscription)")
+Rel(merchant, wh_out, "2xx = delivered; else schedule retry")
+Rel(wh_out, sched, "Enqueue OutgoingWebhookRetryWorkflow task on failure")
+Rel(sched, merchant, "Re-deliver on the retry schedule; each attempt recorded in events")
+Rel(wh_out, kafka, "outgoing_webhook_logs_topic / api & audit events")
+
+note right of wh_in
+  Webhook ingestion is also the entry point for:
+  • relay webhooks  → /webhooks/relay/{merchant_id}/{connector_id}
+  • network token requestor → /webhooks/network_token_requestor/ref
+  • FRM fulfilment      → /webhooks/frm_fulfillment (feature frm)
+  • revenue recovery / billing invoice events (v2 + revenue_recovery)
+end note
+
+SHOW_LEGEND()
+@enduml

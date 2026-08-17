@@ -1,0 +1,56 @@
+@startuml c4-dynamic-routing-decision
+' C4 Dynamic diagram - how a connector is chosen for one payment attempt
+' Grounded in: crates/router/src/core/payments/routing.rs, core/routing, crates/euclid, crates/kgraph_utils,
+'              crates/router/src/core/payments/retry.rs, gateway_status_map table
+!include lib/C4_Sequence.puml
+
+LAYOUT_WITH_LEGEND()
+autonumber "<b>[00]</b>"
+title Dynamic — Connector selection for a payment attempt
+
+Component(payments, "Payments core", "core/payments.rs")
+Component(pre_routed, "Pre-routing shortcuts", "try_pre_routing_connectors")
+Component(dsl, "Static routing (Euclid DSL)", "perform_static_routing_v1 / straight-through")
+Component(cgraph, "Eligibility constraint graph", "kgraph_utils + hyperswitch_constraint_graph")
+Component(vsplit, "Volume split", "perform_dynamic_routing_volume_split")
+Component(dynamic, "Dynamic routing", "success-rate / elimination / contract")
+Component(debit, "Debit routing", "perform_open_routing_for_debit_routing")
+Component(fallback, "Fallback routing", "perform_fallback_routing")
+Component(retry, "GSM retry loop", "core/payments/retry.rs")
+ContainerDb(redis, "Redis", "Routing algorithm cache, cgraph cache")
+ContainerDb(pg, "PostgreSQL", "routing_algorithm, business_profile, merchant_connector_account, gateway_status_map")
+Container_Ext(open_router, "Open Router / Intelligent Router", "gRPC")
+System_Ext(psp, "Selected connector", "")
+
+Rel(payments, pre_routed, "Is the connector already fixed?")
+Rel(pre_routed, payments, "attempt connector, mandate connector, pre-determined connector or token-based connector → ConnectorCallType::PreDetermined")
+Rel(payments, debit, "Card is a debit card and debit routing is enabled → co-badged network choice")
+Rel(payments, dsl, "Evaluate the profile's active routing algorithm")
+Rel(dsl, redis, "Cached algorithm (refresh_routing_cache_v1)")
+Rel(dsl, pg, "routing_algorithm row on cache miss")
+Rel(dsl, payments, "Ordered list of connectors / volume-split groups")
+Rel(payments, cgraph, "Filter by eligibility: payment method, currency, country, capture method, mandate support, connector status")
+Rel(cgraph, redis, "Cached merchant constraint graph")
+Rel(payments, vsplit, "Split traffic between static and dynamic routing per configured percentage")
+Rel(vsplit, dynamic, "Dynamic share")
+Rel(dynamic, open_router, "decide_gateway (success-rate / elimination / contract scores)")
+Rel(open_router, dynamic, "Ranked gateways")
+Rel(payments, fallback, "Nothing eligible → profile fallback (default) connector list")
+Rel(payments, psp, "Execute Authorize on the first connector; ConnectorCallType::Retryable keeps the rest")
+Rel(psp, retry, "Failure with a connector error code")
+Rel(retry, pg, "Look up gateway_status_map (connector, flow, code, message)")
+Rel(retry, payments, "GsmDecision::Retry → next connector, new payment_attempt; DoDefault → surface the error")
+Rel(dynamic, open_router, "Feed the outcome back: update_gateway_score")
+
+note right of dynamic
+  Dynamic routing types (api_models::routing):
+  • SuccessBasedAlgorithm — maximise auth rate
+  • EliminationBasedAlgorithm — avoid failing/degraded PSPs
+  • ContractBasedAlgorithm — honour processor volume contracts
+  Each is toggled per profile and versioned as a
+  routing_algorithm row; results are recorded in
+  dynamic_routing_stats for observability.
+end note
+
+SHOW_LEGEND()
+@enduml

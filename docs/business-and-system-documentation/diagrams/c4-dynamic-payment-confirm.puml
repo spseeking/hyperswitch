@@ -1,0 +1,61 @@
+@startuml c4-dynamic-payment-confirm
+' C4 Dynamic diagram - card payment with 3DS, from create to capture
+' Grounded in: core/payments.rs (payments_operation_core, call_connector_service), operations/payment_confirm.rs,
+'              core/payments/routing.rs, core/payments/retry.rs, core/webhooks/*
+!include lib/C4_Sequence.puml
+
+LAYOUT_WITH_LEGEND()
+autonumber "<b>[00]</b>"
+title Dynamic — Card payment: create → confirm → 3DS → authorize → capture
+
+Person(shopper, "Shopper")
+Container(sdk, "Checkout SDK", "JS/WASM")
+Container_Ext(merchant, "Merchant backend", "any")
+Container(router, "Router", "Rust / actix-web")
+Component(ops, "Payments operation pipeline", "core/payments/operations")
+Component(routing, "Routing & decisioning", "core/payments/routing.rs, decision manager")
+Component(vault, "Vault / payment methods", "core/payment_methods")
+Container(locker, "Card Vault (locker)", "Rust")
+ContainerDb(pg, "PostgreSQL", "")
+ContainerDb(redis, "Redis", "")
+Component(sched, "Process tracker", "crates/scheduler")
+System_Ext(psp, "Processor (e.g. Adyen)", "")
+System_Ext(issuer, "Issuer / 3DS ACS", "")
+
+Rel(merchant, router, "POST /payments (amount, currency, capture_method, customer, metadata) → returns payment_id + client_secret")
+Rel(router, ops, "PaymentCreate: validate → get_tracker → domain → update_tracker")
+Rel(ops, pg, "INSERT payment_intent (status = requires_payment_method / requires_confirmation)")
+Rel(shopper, sdk, "Chooses payment method, enters card")
+Rel(sdk, router, "POST /payments/{id}/confirm with publishable key + client_secret")
+Rel(router, ops, "PaymentConfirm operation, guarded by an API lock in Redis")
+Rel(ops, redis, "Acquire per-payment lock (core/api_locking.rs)")
+Rel(ops, vault, "Tokenize card into temp locker; blocklist + card-testing-guard checks")
+Rel(vault, locker, "Store card, get token")
+Rel(ops, routing, "call_decision_manager (3DS vs no-3DS, surcharge/tax), then connector selection")
+Rel(routing, redis, "Cached routing algorithm + constraint graph; dynamic-routing scores")
+Rel(routing, ops, "ConnectorCallType::PreDetermined / Retryable(list) / SessionMultiple")
+Rel(ops, psp, "Authorize (3DS requested): call_connector_service → ConnectorIntegration<Authorize>")
+Rel(psp, ops, "redirect_to_url + status = authentication_pending")
+Rel(ops, pg, "INSERT payment_attempt, UPDATE intent → requires_customer_action")
+Rel(ops, sched, "Schedule PaymentsSyncWorkflow task for pending status")
+Rel(router, sdk, "next_action = redirect_to_url")
+Rel(sdk, issuer, "Browser redirect / challenge")
+Rel(issuer, router, "Return to /payments/redirect/{payment_id}/{merchant_id}/{attempt_id}")
+Rel(router, ops, "CompleteAuthorize: finish 3DS, re-call connector")
+Rel(ops, psp, "CompleteAuthorize / capture depending on capture_method")
+Rel(psp, ops, "Authorized (manual capture) or Charged (automatic)")
+Rel(ops, pg, "UPDATE attempt + intent status; save payment method if setup_future_usage")
+Rel(ops, merchant, "Outgoing webhook payment_succeeded / requires_capture (signed)")
+Rel(merchant, router, "POST /payments/{id}/capture (manual capture only)")
+Rel(psp, router, "Async connector webhook → /webhooks/{merchant_id}/{connector} reconciles final status")
+
+note right of routing
+  Failure handling: if the attempt fails, GSM
+  (gateway_status_map) maps the connector error to
+  GsmDecision::Retry and core/payments/retry.rs walks the
+  next connector in the Retryable list, creating a new
+  payment_attempt for the same payment_intent.
+end note
+
+SHOW_LEGEND()
+@enduml

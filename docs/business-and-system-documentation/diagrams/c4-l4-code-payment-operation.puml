@@ -1,0 +1,176 @@
+@startuml c4-l4-code-payment-operation
+' C4 Level 4 (Code) - the payment Operation pipeline traits and their implementations
+' Grounded in: crates/router/src/core/payments/operations.rs, operations/*.rs, core/payments.rs (payments_operation_core)
+skinparam classAttributeIconSize 0
+skinparam class {
+  BackgroundColor #FFFFFF
+  BorderColor #1168BD
+  ArrowColor #444444
+}
+hide empty members
+title C4 L4 (Code) — Payments operation pipeline (crates/router/src/core/payments)
+
+package "core::payments" {
+  class payments_operation_core <<function>> {
+    + payments_operation_core<F, Req, Op, FData, D>(state, platform, operation, req, call_connector_action, auth_flow, header_payload)
+    --
+    1 operation.to_validate_request().validate_request()
+    2 operation.to_get_tracker().get_trackers()
+    3 domain.get_or_create_customer_details()
+    4 domain.run_decision_manager() / surcharge + tax
+    5 domain.perform_routing() → ConnectorCallType
+    6 operation.to_update_tracker().update_trackers()
+    7 call_connector_service() / call_multiple_connectors_service()
+    8 retry::do_gsm_actions() on failure
+    9 operation.to_post_update_tracker().update_tracker()
+  }
+}
+
+package "operations (traits)" {
+  interface "Operation<F, T>" as Operation {
+    + type Data
+    + to_validate_request() : &ValidateRequest
+    + to_get_tracker() : &GetTracker
+    + to_domain() : &Domain
+    + to_update_tracker() : &UpdateTracker
+    + to_post_update_tracker() : &PostUpdateTracker
+  }
+  interface "ValidateRequest<F, R, D>" as ValidateRequest {
+    + validate_request(request, platform) : (BoxedOperation, ValidateResult)
+  }
+  interface "GetTracker<F, D, R>" as GetTracker {
+    + get_trackers(state, payment_id, request, merchant_context, ...) : GetTrackerResponse<D>
+  }
+  interface "Domain<F, R, D>" as Domain {
+    + get_or_create_customer_details()
+    + make_pm_data() / create_or_fetch_payment_method()
+    + run_decision_manager()
+    + get_connector() / perform_routing() : ConnectorCallType
+    + guard_payment_against_blocklist()
+    + call_external_three_ds_authentication_if_eligible()
+    + call_unified_authentication_service_if_eligible()
+    + payments_dynamic_tax_calculation()
+    + add_task_to_process_tracker()
+  }
+  interface "UpdateTracker<F, D, R>" as UpdateTracker {
+    + update_trackers(state, req_state, payment_data, customer, storage_scheme, ...) : (BoxedOperation, D)
+  }
+  interface "PostUpdateTracker<F, D, R>" as PostUpdateTracker {
+    + update_tracker(state, payment_data, response, key_store, storage_scheme, ...) : D
+  }
+
+  Operation --> ValidateRequest
+  Operation --> GetTracker
+  Operation --> Domain
+  Operation --> UpdateTracker
+  Operation --> PostUpdateTracker
+}
+
+package "operations (v1 implementations)" {
+  class PaymentCreate
+  class PaymentConfirm
+  class PaymentStatus
+  class PaymentCapture
+  class PaymentCancel
+  class PaymentSession
+  class CompleteAuthorize
+  class PaymentApprove
+  class PaymentReject
+  class PaymentUpdate
+  class PaymentRecurrence
+  class PaymentIncrementalAuthorization
+  class PaymentExtendAuthorization
+  class PaymentPostSessionTokens
+  class PaymentUpdateMetadata
+  class PaymentSessionUpdate <<dynamic tax>>
+  class PaymentStart
+  class PaymentCancelPostCapture
+  class PaymentResponse <<PostUpdateTracker>>
+}
+
+package "operations (v2 implementations)" {
+  class PaymentIntentCreate <<payment_create_intent>>
+  class PaymentIntentConfirm <<payment_confirm_intent>>
+  class PaymentGetIntent
+  class PaymentUpdateIntent
+  class PaymentAttemptRecord
+  class PaymentGetListAttempts
+  class PaymentProxyIntent
+  class ExternalVaultProxyPaymentIntent
+  class PaymentExternalVaultProxyConfirm
+  class PaymentSessionIntent
+  class PaymentGet
+}
+
+package "payment data (Op::Data)" {
+  class PaymentData <<v1>> {
+    payment_intent : PaymentIntent
+    payment_attempt : PaymentAttempt
+    payment_method_data : Option<PaymentMethodData>
+    mandate_id / setup_mandate
+    surcharge_details / tax_data
+    connector_customer_id
+    authentication_data
+    frm_message
+  }
+  class PaymentConfirmData <<v2>>
+  class PaymentStatusData <<v2>>
+  class PaymentIntentData <<v2>>
+}
+
+package "connector execution" {
+  class RouterData <<hyperswitch_domain_models>> {
+    flow : PhantomData<Flow>
+    request : Req
+    response : Result<Res, ErrorResponse>
+    connector_auth_type, merchant_id, payment_id, attempt_id
+    status : AttemptStatus
+  }
+  interface "ConnectorIntegration<Flow, Req, Res>" as ConnectorIntegration {
+    + get_headers() / get_url() / get_request_body()
+    + build_request(req, connectors) : Option<Request>
+    + handle_response(data, res) : RouterData<Flow, Req, Res>
+    + get_error_response(res) : ErrorResponse
+  }
+  class "retry::do_gsm_actions" as Gsm <<function>> {
+    reads gateway_status_map
+    GsmDecision::{Retry, DoDefault, …}
+  }
+}
+
+payments_operation_core ..> Operation : drives
+ValidateRequest <|.. PaymentCreate
+GetTracker <|.. PaymentCreate
+Domain <|.. PaymentCreate
+UpdateTracker <|.. PaymentCreate
+Operation <|.. PaymentConfirm
+Operation <|.. PaymentStatus
+Operation <|.. PaymentCapture
+Operation <|.. PaymentCancel
+Operation <|.. PaymentSession
+Operation <|.. CompleteAuthorize
+Operation <|.. PaymentApprove
+Operation <|.. PaymentReject
+Operation <|.. PaymentUpdate
+Operation <|.. PaymentIncrementalAuthorization
+Operation <|.. PaymentExtendAuthorization
+Operation <|.. PaymentSessionUpdate
+Operation <|.. PaymentIntentCreate
+Operation <|.. PaymentIntentConfirm
+Operation <|.. PaymentGetIntent
+Operation <|.. PaymentProxyIntent
+PostUpdateTracker <|.. PaymentResponse
+PaymentConfirm --> PaymentData : Data =
+PaymentIntentConfirm --> PaymentConfirmData : Data =
+payments_operation_core ..> RouterData : constructs per flow
+RouterData ..> ConnectorIntegration : executed by
+payments_operation_core ..> Gsm : on attempt failure
+
+note bottom of payments_operation_core
+  Every payment API endpoint is one Operation struct; adding a
+  capability means implementing the five traits rather than
+  changing the orchestrator. The same pipeline is reused by
+  proxy_for_payments_operation_core (proxy/relay payments) and
+  external_vault_proxy_for_payments_operation_core (BYO vault).
+end note
+@enduml

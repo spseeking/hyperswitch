@@ -1,0 +1,49 @@
+@startuml c4-l1-system-context
+' C4 Level 1 - System Context for Hyperswitch
+' Source of truth: juspay/hyperswitch @ 9b8b89dc
+!include lib/C4_Context.puml
+
+LAYOUT_WITH_LEGEND()
+title C4 L1 — System Context: Hyperswitch payments orchestration
+
+Person(shopper, "Shopper / Payer", "Pays on the merchant's checkout, authenticates with the issuer, may complete a payment link or a payout link")
+Person(merchant_ops, "Merchant operations user", "Ops/finance/engineering staff of the merchant: configures connectors and routing, handles disputes, refunds, reports")
+Person(platform_admin, "Platform / tenant admin", "Runs the Hyperswitch deployment: onboards organizations, sets tenants, manages RBAC, themes, API keys")
+
+System_Boundary(hs_boundary, "Hyperswitch deployment") {
+  System(hyperswitch, "Hyperswitch", "Connector-agnostic payments orchestrator: payments, refunds, disputes, mandates, subscriptions, payouts, vaulting, routing, webhooks, analytics")
+}
+
+System_Ext(merchant_app, "Merchant application", "Merchant backend/storefront that calls the Hyperswitch API with an API key and consumes outgoing webhooks")
+System_Ext(sdk, "Hyperswitch SDKs / Payment & Payout links", "Web, iOS, Android and headless SDKs plus hosted link pages; use a publishable key + client secret")
+System_Ext(control_center, "Hyperswitch Control Center", "Merchant-facing dashboard SPA; authenticates via JWT / SSO and drives the OLAP + admin APIs")
+
+System_Ext(psp, "Payment processors & rails (~150)", "Stripe, Adyen, Checkout, Cybersource, Worldpay, PayPal, Braintree, Razorpay, UPI/PIX/wallets, BNPL, bank redirects, crypto")
+System_Ext(payout_rail, "Payout processors", "Adyen Platform, Wise, Nomupay, Hyperwallet, Wells Fargo payout, Stripe payouts")
+System_Ext(threeds, "3DS / authentication providers", "Netcetera, Threedsecure.io, Gpayments, Juspay 3DS server, Click to Pay (CTP Mastercard, Visa)")
+System_Ext(frm, "Fraud & risk providers", "Signifyd, Riskified, Sift, Cybersource Decision Manager")
+System_Ext(vault_ext, "Card vaults / tokenization", "Hyperswitch Card Vault (locker), VGS, TokenEx, network token requestors")
+System_Ext(billing, "Billing / subscription providers", "Chargebee, Stripe Billing, Recurly, custom billing")
+System_Ext(aux, "Auxiliary services", "Forex rates API, tax (Taxjar), email (SES/SMTP), file storage (S3), CRM, OIDC identity provider, Superposition config, Open Router / Intelligent Router, Offer Engine")
+
+Rel(shopper, sdk, "Enters payment details, authenticates (3DS/OTP), completes redirects", "HTTPS")
+Rel(shopper, merchant_app, "Shops / checks out", "HTTPS")
+Rel(merchant_app, hyperswitch, "Create & confirm payments, refunds, payouts, customers, mandates", "REST / JSON, api-key")
+Rel(sdk, hyperswitch, "Session tokens, payment-method list, confirm, poll status", "REST / JSON, publishable key + client secret")
+Rel_Back(merchant_app, hyperswitch, "Outgoing webhooks: payment / refund / dispute / mandate / payout / subscription events", "HTTPS POST, signed")
+
+Rel(merchant_ops, control_center, "Configure connectors, routing rules, review payments & disputes", "HTTPS")
+Rel(platform_admin, control_center, "Org/merchant onboarding, users & roles, themes", "HTTPS")
+Rel(control_center, hyperswitch, "Admin + OLAP APIs", "REST / JSON, JWT")
+
+Rel(hyperswitch, psp, "Authorize, capture, void, sync, refund, dispute evidence, session tokens", "HTTPS, connector-specific")
+Rel_Back(hyperswitch, psp, "Incoming webhooks (status, disputes, mandates)", "HTTPS POST, signature verified")
+Rel(hyperswitch, payout_rail, "Create / fulfill / cancel payouts", "HTTPS")
+Rel(hyperswitch, threeds, "Pre-authentication, authentication, ARes/CRes handling", "HTTPS")
+Rel(hyperswitch, frm, "Pre-/post-transaction risk checks, fulfillment signals", "HTTPS")
+Rel(hyperswitch, vault_ext, "Store / retrieve card & bank credentials, network tokenization", "HTTPS, mTLS + JWE/JWS")
+Rel(hyperswitch, billing, "Subscription & invoice sync, revenue recovery signals", "HTTPS")
+Rel(hyperswitch, aux, "Forex, tax, email, files, SSO, remote config, routing scores, offers", "HTTPS / gRPC")
+
+SHOW_LEGEND()
+@enduml
