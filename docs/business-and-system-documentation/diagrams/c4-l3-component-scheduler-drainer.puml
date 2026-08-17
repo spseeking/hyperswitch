@@ -1,0 +1,65 @@
+@startuml c4-l3-component-scheduler-drainer
+' C4 Level 3 - Components inside the Scheduler (producer/consumer) and Drainer containers
+' Grounded in: crates/scheduler/src/*, crates/router/src/workflows/*, crates/drainer/src/*, common_enums::ProcessTrackerRunner
+!include lib/C4_Component.puml
+
+LAYOUT_WITH_LEGEND()
+title C4 L3 — Components: Scheduler (producer + consumer) and Drainer
+
+ContainerDb_Ext(pg, "PostgreSQL", "PostgreSQL", "process_tracker, domain tables")
+ContainerDb_Ext(redis, "Redis", "Redis", "Scheduler streams + KV write-ahead streams")
+System_Ext(connectors_ext, "Connectors / merchant endpoints", "External", "Sync calls, outgoing webhook delivery")
+Container_Ext(router, "Router", "Rust", "Inserts process_tracker tasks during API flows")
+
+Container_Boundary(producer, "Scheduler — Producer") {
+  Component(prod_loop, "Producer loop", "scheduler/src/producer.rs", "Runs on a loop interval, acquires a Redis lock (producer.lock_key / lock_ttl) so only one producer batches at a time")
+  Component(task_fetch, "Due-task fetcher", "scheduler/src/db/process_tracker.rs", "SELECTs tasks whose schedule_time falls inside the producer.lower_fetch_limit..upper_fetch_limit window and are not yet finished")
+  Component(batcher, "Batcher", "scheduler/src/utils.rs", "Groups tasks into ProcessTrackerBatch objects of producer.batch_size and XADDs them to the SCHEDULER_STREAM for the tenant")
+}
+
+Container_Boundary(consumer, "Scheduler — Consumer") {
+  Component(cons_loop, "Consumer loop", "scheduler/src/consumer.rs", "Reads batches from SCHEDULER_STREAM via the SCHEDULER_GROUP consumer group; can be disabled via scheduler.consumer.disabled; graceful shutdown on signals")
+  Component(dispatcher, "Workflow dispatcher", "scheduler/src/workflows.rs + router/src/workflows.rs", "Maps ProcessTrackerRunner value on the task to a ProcessTrackerWorkflow implementation")
+  Component(wf_psync, "PaymentsSyncWorkflow", "workflows/payment_sync.rs", "Polls the connector for pending payments, updates intent/attempt, emits webhooks, re-schedules with backoff or marks the task finished")
+  Component(wf_refund, "RefundWorkflowRouter", "workflows/refund_router.rs", "Retries/syncs refunds until terminal state")
+  Component(wf_webhook, "OutgoingWebhookRetryWorkflow", "workflows/outgoing_webhook_retry.rs", "Re-delivers failed merchant webhooks per retry schedule and records delivery attempts")
+  Component(wf_recovery, "PassiveRecoveryWorkflow", "workflows/revenue_recovery.rs", "Revenue-recovery retry attempts driven by the recovery decider (features v2 + revenue_recovery)")
+  Component(wf_dispute, "ProcessDispute / DisputeList", "workflows/process_dispute.rs, dispute_list.rs", "Pulls and processes dispute updates from connectors")
+  Component(wf_payout, "PayoutSyncWorkFlow / AttachPayoutAccount", "workflows/payout_sync.rs, attach_payout_account_workflow.rs", "Payout status sync and payout-account attachment (feature payouts)")
+  Component(wf_pm, "Payment-method workflows", "workflows/payment_method_status_update.rs, payment_method_modular_*_compat.rs, tokenized_data.rs, network_tokenization.rs", "PM status updates, modular PM migration, temp-token cleanup, network token refresh")
+  Component(wf_misc, "Housekeeping workflows", "workflows/api_key_expiry.rs, batch_blocklist_upload.rs, invoice_sync.rs, post_capture_void_sync.rs", "API-key expiry reminders, blocklist batch ingestion, invoice sync, post-capture void sync")
+}
+
+Container_Boundary(drainer, "Drainer") {
+  Component(stream_reader, "Stream reader", "drainer/src/stream.rs, handler.rs", "Round-robins over configured KV stream shards, XREADs entries, honours max_read_count and shutdown signals")
+  Component(kv_applier, "KV applier", "drainer/src/query.rs, types.rs", "Deserialises DBOperation entries (Insert/Update) and applies them to PostgreSQL preserving intent/attempt ordering")
+  Component(drainer_health, "Health & metrics", "drainer/src/health_check.rs, metrics.rs", "HTTP health endpoint plus stream-lag and apply-latency metrics")
+}
+
+Rel(router, pg, "INSERT process_tracker task (schedule_time, runner, tracking_data)")
+Rel(router, redis, "XADD KV entries when storage_scheme = RedisKv")
+
+Rel(prod_loop, task_fetch, "each tick")
+Rel(task_fetch, pg, "SELECT … FOR UPDATE / status update to processing")
+Rel(batcher, redis, "XADD batch")
+Rel(prod_loop, batcher, "")
+Rel(cons_loop, redis, "XREAD / XACK batch")
+Rel(cons_loop, dispatcher, "for each task")
+Rel(dispatcher, wf_psync, "")
+Rel(dispatcher, wf_refund, "")
+Rel(dispatcher, wf_webhook, "")
+Rel(dispatcher, wf_recovery, "")
+Rel(dispatcher, wf_dispute, "")
+Rel(dispatcher, wf_payout, "")
+Rel(dispatcher, wf_pm, "")
+Rel(dispatcher, wf_misc, "")
+Rel(wf_psync, connectors_ext, "PSync call")
+Rel(wf_webhook, connectors_ext, "POST merchant webhook endpoint")
+Rel(wf_psync, pg, "update intent/attempt + task")
+Rel(wf_refund, pg, "update refund + task")
+Rel(stream_reader, redis, "XREAD")
+Rel(kv_applier, pg, "INSERT/UPDATE")
+Rel(stream_reader, kv_applier, "")
+
+SHOW_LEGEND()
+@enduml

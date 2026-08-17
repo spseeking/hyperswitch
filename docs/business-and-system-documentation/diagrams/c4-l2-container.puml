@@ -1,0 +1,73 @@
+@startuml c4-l2-container
+' C4 Level 2 - Containers of a Hyperswitch deployment
+' Grounded in: crates/router/src/bin/*, crates/drainer, crates/scheduler, docker-compose.yml, config/development.toml
+!include lib/C4_Container.puml
+
+LAYOUT_WITH_LEGEND()
+title C4 L2 — Containers: Hyperswitch deployment
+
+Person(shopper, "Shopper / Payer")
+Person(ops_user, "Merchant ops / admin user")
+System_Ext(merchant_app, "Merchant application", "Server-to-server API consumer")
+System_Ext(connectors_ext, "Connectors", "~150 processors, 3DS servers, FRM, vaults, billing, payout rails")
+
+System_Boundary(hs, "Hyperswitch") {
+  Container(sdk_web, "Checkout SDK / Payment link page", "JS, WASM", "Renders payment methods, collects card data, handles 3DS redirects; served from payment_link + hyperswitch-web")
+  Container(control_center, "Control Center", "ReScript / React SPA", "Merchant dashboard: connectors, routing, payments ops, analytics")
+
+  Container(router, "Router (hyperswitch-server)", "Rust, actix-web (crates/router, bin/router.rs)", "The API application: OLTP payment flows + OLAP/admin APIs, webhook ingestion, connector calls, routing, vault access")
+  Container(producer, "Scheduler Producer", "Rust (crates/scheduler, bin/scheduler.rs)", "Polls process_tracker for due tasks, batches them into Redis streams")
+  Container(consumer, "Scheduler Consumer", "Rust (crates/scheduler)", "Pops batches from Redis streams and executes workflows (payment sync, refund, webhook retry, recovery…)")
+  Container(drainer, "Drainer", "Rust (crates/drainer)", "Drains Redis KV streams into PostgreSQL when a merchant runs in RedisKv storage scheme")
+  Container(analytics_svc, "Analytics / OLAP query layer", "Rust (crates/analytics, feature olap)", "Serves metrics, filters, reports and search over ClickHouse / SQLx / OpenSearch")
+
+  ContainerDb(pg_master, "PostgreSQL (master)", "PostgreSQL 13+", "Authoritative store: payment_intent, payment_attempt, refund, dispute, mandate, accounts, process_tracker, events…")
+  ContainerDb(pg_replica, "PostgreSQL (replica)", "PostgreSQL", "Read replica used by list/OLAP queries (replica_database config)")
+  ContainerDb(redis, "Redis (cluster or standalone)", "Redis 7", "Cache (accounts, routing algorithms, constraint graph), distributed locks, KV write-ahead streams, scheduler queues")
+  ContainerDb(clickhouse, "ClickHouse", "ClickHouse", "Analytics event store fed by Kafka topics")
+  ContainerDb(opensearch, "OpenSearch", "OpenSearch", "Global search over payments/refunds/disputes events")
+  Container(kafka, "Kafka", "Kafka", "Event bus for intent/attempt/refund/dispute/audit/api/webhook/routing events")
+
+  Container(locker, "Card Vault (locker)", "Rust, external service", "PCI-scope card & bank credential storage; JWE/JWS + mTLS (hyperswitch-card-vault)")
+  Container(keymanager, "Key Manager", "Rust, external service", "Per-entity data-encryption keys; encrypts customer/PII columns (feature encryption_service)")
+  Container(ucs, "Unified Connector Service", "gRPC service", "Optional out-of-process connector execution path (grpc_client.unified_connector_service)")
+  Container(open_router, "Open Router / Intelligent Router", "gRPC / HTTP service", "Dynamic routing: success-rate, elimination and contract scoring; gateway score feedback")
+  Container(superposition, "Superposition", "Config service", "Remote/experiment-driven configuration overrides")
+}
+
+Rel(shopper, sdk_web, "Enters payment details / completes 3DS", "HTTPS")
+Rel(ops_user, control_center, "Uses", "HTTPS")
+Rel(sdk_web, router, "session tokens, /payments/{id}/confirm, payment-method list, poll", "REST, publishable key + client secret")
+Rel(control_center, router, "admin, OLAP, user & RBAC APIs", "REST, JWT")
+Rel(merchant_app, router, "payments, refunds, payouts, customers, mandates, webhooks config", "REST, api-key")
+Rel(router, merchant_app, "Outgoing webhooks (signed)", "HTTPS POST")
+
+Rel(router, connectors_ext, "Connector requests (authorize/capture/refund/…)", "HTTPS")
+Rel(connectors_ext, router, "Incoming webhooks → /webhooks/{merchant_id}/{connector}", "HTTPS POST")
+
+Rel(router, pg_master, "Reads/writes domain state", "Diesel / bb8 pool")
+Rel(router, pg_replica, "List & analytics reads", "Diesel")
+Rel(router, redis, "Cache, locks, KV stream writes, scheduler task enqueue", "RESP")
+Rel(router, locker, "Store/retrieve card data, tokenize", "HTTPS + JWE/JWS")
+Rel(router, keymanager, "Create/fetch DEKs, encrypt/decrypt PII", "HTTPS (mTLS optional)")
+Rel(router, ucs, "Execute connector flow out-of-process", "gRPC")
+Rel(router, open_router, "decide_gateway / update_gateway_score", "gRPC")
+Rel(router, superposition, "Fetch config overrides", "HTTPS")
+Rel(router, kafka, "Publishes domain & audit events", "Kafka protocol")
+
+Rel(producer, pg_master, "Fetches due process_tracker tasks", "Diesel")
+Rel(producer, redis, "Pushes task batches to streams", "RESP")
+Rel(consumer, redis, "Consumes task batches", "RESP")
+Rel(consumer, pg_master, "Updates task & domain state", "Diesel")
+Rel(consumer, connectors_ext, "Sync / retry / recovery connector calls", "HTTPS")
+Rel(drainer, redis, "Reads KV streams", "RESP")
+Rel(drainer, pg_master, "Applies buffered writes", "Diesel")
+
+Rel(kafka, clickhouse, "Ingest (Vector / Kafka engine)", "")
+Rel(kafka, opensearch, "Ingest via Vector", "")
+Rel(analytics_svc, clickhouse, "Aggregations, metrics, reports", "HTTP")
+Rel(analytics_svc, opensearch, "Global search", "HTTP")
+Rel(router, analytics_svc, "In-process (feature olap)", "Rust call")
+
+SHOW_LEGEND()
+@enduml

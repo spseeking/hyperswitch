@@ -1,0 +1,81 @@
+@startuml c4-deployment-docker-compose
+' C4 Deployment diagram - local / self-hosted docker compose topology
+' Grounded in: docker-compose.yml, docker-compose-development.yml, config/docker_compose.toml, scripts/setup.sh
+!include lib/C4_Deployment.puml
+
+LAYOUT_WITH_LEGEND()
+title C4 Deployment — self-hosted Docker Compose topology (scripts/setup.sh profiles)
+
+Deployment_Node(host, "Docker host", "Docker / Podman, network router_net") {
+
+  Deployment_Node(app_profile, "Default (no profile) — app + data stores", "docker compose up -d") {
+    Container(server, "hyperswitch-server", "Rust binary router", "API on :8080; health at /health, /health/ready")
+    Container(web, "hyperswitch-web", "Node/JS", "Checkout SDK bundle on :9050")
+    Container(superposition_c, "superposition + superposition-init", "Config service", "Remote configuration / experiments on :8081")
+    Container(cc, "hyperswitch-control-center", "SPA", "Dashboard on :9000")
+    Container(migration, "migration_runner", "diesel CLI", "Runs migrations/ before the server starts")
+    Container(default_user, "create-default-user", "script", "Seeds a dashboard user for first login")
+    ContainerDb(pg, "pg", "PostgreSQL (postgres:latest)", ":5432, volume pg_data, database hyperswitch_db")
+    ContainerDb(redis, "redis-standalone", "Redis 7", "Cache, locks, KV and scheduler streams")
+  }
+
+  Deployment_Node(full_profile, "Profiles: scheduler / full_kv / monitoring", "--profile scheduler --profile full_kv --profile monitoring") {
+    Container(producer, "hyperswitch-producer", "Rust binary scheduler", "SCHEDULER_FLOW=producer")
+    Container(consumer, "hyperswitch-consumer", "Rust binary scheduler", "SCHEDULER_FLOW=consumer")
+    Container(drainer, "hyperswitch-drainer", "Rust binary drainer", "Drains Redis KV streams into PostgreSQL")
+    Container(otel, "otel-collector", "OpenTelemetry Collector", "Receives OTLP metrics/traces from the router")
+    Container(prom, "prometheus", "Prometheus", "Scrapes the collector :9090")
+    Container(tempo, "tempo", "Grafana Tempo", "Trace store")
+    Container(loki, "loki", "Grafana Loki", "Log store (promtail/vector shipper)")
+    Container(grafana, "grafana", "Grafana", "Dashboards :3000")
+  }
+
+  Deployment_Node(olap_profile, "Profile: olap (analytics)", "--profile olap") {
+    Container(kafka0, "kafka0", "Kafka", "Domain event topics (hyperswitch-payment-intent-events, …)")
+    Container(kafka_ui, "kafka-ui", "Kafka UI", "Topic inspection")
+    ContainerDb(ch, "clickhouse-server", "ClickHouse", "Analytics tables; volume ckh_data")
+    Container(vector, "vector", "Vector", "Kafka → ClickHouse / OpenSearch pipelines")
+    ContainerDb(os, "opensearch", "OpenSearch", "Global search index")
+    Container(os_dash, "opensearch-dashboards", "OpenSearch Dashboards", "Search UI")
+  }
+
+  Deployment_Node(aux_profile, "Profiles: full_setup / clustered_redis", "--profile full_setup --profile clustered_redis") {
+    Container(mailhog, "mailhog", "SMTP sink", "Captures user-management emails locally (:8025 UI)")
+    Container(demo, "hyperswitch-demo", "React demo app", "Demo checkout store on :9060 / :5252")
+    ContainerDb(redis_cluster, "redis-cluster + redis-init", "Redis 7 cluster", "Clustered Redis alternative to redis-standalone")
+    Container(redis_insight, "redis-insight", "Redis Insight", ":8001, volume redisinsight_store (monitoring profile)")
+  }
+}
+
+Deployment_Node(external, "External / SaaS", "reached over the internet") {
+  Container(locker_ext, "Hyperswitch Card Vault", "Rust", "Optional; without it, card data uses the temp locker / basilisk-hs config")
+  Container(psp_ext, "Connector sandboxes", "HTTPS", "Stripe, Adyen, … test endpoints; dummy_connector feature can replace them")
+}
+
+Rel(server, pg, "SQL", "5432")
+Rel(server, redis, "RESP", "6379")
+Rel(server, kafka0, "Publish events", "9092")
+Rel(server, otel, "OTLP", "4317")
+Rel(server, superposition_c, "Fetch config overrides", "HTTP")
+Rel(server, locker_ext, "HTTPS + JWE/JWS")
+Rel(server, psp_ext, "HTTPS")
+Rel(producer, pg, "Fetch due tasks")
+Rel(producer, redis, "XADD batches")
+Rel(consumer, redis, "XREAD batches")
+Rel(consumer, pg, "Update tasks & domain state")
+Rel(drainer, redis, "XREAD KV streams")
+Rel(drainer, pg, "Apply writes")
+Rel(migration, pg, "diesel migration run")
+Rel(cc, server, "REST (JWT)")
+Rel(web, server, "REST (publishable key)")
+Rel(demo, web, "Embeds SDK")
+Rel(vector, kafka0, "Consume")
+Rel(vector, ch, "Insert")
+Rel(vector, os, "Index")
+Rel(grafana, prom, "PromQL")
+Rel(grafana, loki, "LogQL")
+Rel(grafana, tempo, "TraceQL")
+Rel(prom, otel, "Scrape")
+
+SHOW_LEGEND()
+@enduml
