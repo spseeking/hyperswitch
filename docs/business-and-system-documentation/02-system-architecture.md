@@ -10,8 +10,8 @@ Render everything with:
 
 ```bash
 cd diagrams
-java -jar plantuml.jar -tsvg *.puml     # PlantUML >= 1.2025.x required by C4-PlantUML
-java -jar plantuml.jar -tpng *.puml
+java -jar plantuml.jar -DRELATIVE_INCLUDE=1 -tsvg *.puml   # PlantUML >= 1.2025.x required by C4-PlantUML
+java -jar plantuml.jar -DRELATIVE_INCLUDE=1 -tpng *.puml
 ```
 
 | C4 level | Diagram source | Rendered |
